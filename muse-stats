@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Muse usage dashboard. Parses local session logs, writes a
+self-contained HTML report, optionally serves it on localhost."""
+import html
+import json
+import os
+import sqlite3
+import sys
+
+STORE = os.path.expanduser("~/.local/share/muse")
+SESS_DIR = os.path.join(STORE, "sessions")
+INDEX_DB = os.path.join(STORE, "session-index.db")
+OUT = "/tmp/muse-stats.html"
+
+
+def iter_logs():
+    for root, _, files in os.walk(SESS_DIR):
+        if "session.jsonl" in files:
+            yield os.path.join(root, "session.jsonl")
+
+
+def parse():
+    per_model = {}
+    total = {"requests": 0, "input": 0, "output": 0, "cached": 0,
+             "cache_read": 0, "cache_write": 0, "reasoning": 0,
+             "duration_ms": 0, "errors": 0}
+    sessions_seen = 0
+    for path in iter_logs():
+        sessions_seen += 1
+        try:
+            fh = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if 'model_completed' not in line:
+                    continue
+                try:
+                    outer = json.loads(line)
+                except ValueError:
+                    continue
+                ev = (outer.get("payload") or {}).get("event") or {}
+                if ev.get("kind") != "model_completed":
+                    continue
+                model = ev.get("model") or "unknown"
+                u = ev.get("usage") or {}
+                b = per_model.setdefault(model, {"requests": 0, "input": 0,
+                                                 "output": 0, "cached": 0})
+                b["requests"] += 1
+                b["input"] += u.get("input_tokens", 0)
+                b["output"] += u.get("output_tokens", 0)
+                b["cached"] += u.get("cached_tokens", 0)
+                total["requests"] += 1
+                total["input"] += u.get("input_tokens", 0)
+                total["output"] += u.get("output_tokens", 0)
+                total["cached"] += u.get("cached_tokens", 0)
+                total["cache_read"] += u.get("cache_read_tokens", 0)
+                total["cache_write"] += u.get("cache_write_tokens", 0)
+                total["reasoning"] += u.get("reasoning_tokens", 0)
+                total["duration_ms"] += ev.get("duration_ms", 0) or 0
+    try:
+        con = sqlite3.connect(INDEX_DB)
+        row = con.execute("SELECT COUNT(*), "
+                          "datetime(MIN(created_at_us/1000000),'unixepoch'), "
+                          "datetime(MAX(created_at_us/1000000),'unixepoch') "
+                          "FROM sessions").fetchone()
+        con.close()
+    except sqlite3.Error:
+        row = (sessions_seen, "?", "?")
+    return total, per_model, row
+
+
+def render(total, per_model, row):
+    n = total["requests"] or 1
+    rows = sorted(per_model.items(), key=lambda kv: -kv[1]["requests"])
+    body = "\n".join(
+        "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%d</td></tr>"
+        % (html.escape(m), b["requests"], b["input"], b["output"], b["cached"])
+        for m, b in rows)
+    return """<!doctype><html><head><meta charset="utf-8">
+<title>Muse Usage Statistics</title>
+<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:2em auto;
+padding:0 1em}table{border-collapse:collapse;width:100%%}
+td,th{border:1px solid #ccc;padding:.3em .6em;text-align:right}
+td:first-child,th:first-child{text-align:left}</style></head><body>
+<h1>Muse Usage Statistics</h1>
+<p>Sessions: %s &middot; window %s to %s</p>
+<h2>Overall</h2>
+<ul><li>Requests: %d</li><li>Total tokens: %d</li>
+<li>Input: %d</li><li>Output: %d</li><li>Cached: %d</li>
+<li>Cache read: %d &middot; write: %d</li>
+<li>Avg duration: %.1fs</li></ul>
+<h2>By model</h2>
+<table><tr><th>Model</th><th>Reqs</th><th>Input</th>
+<th>Output</th><th>Cached</th></tr>%s</table>
+</body></html>""" % (
+        row[0], row[1], row[2], total["requests"],
+        total["input"] + total["output"], total["input"], total["output"],
+        total["cached"], total["cache_read"], total["cache_write"],
+        total["duration_ms"] / 1000.0 / n, body)
+
+
+def main():
+    total, per_model, row = parse()
+    with open(OUT, "w", encoding="utf-8") as fh:
+        fh.write(render(total, per_model, row))
+    print("wrote", OUT)
+    if "--serve" in sys.argv:
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+        import functools
+        port = 8487
+        h = functools.partial(SimpleHTTPRequestHandler, directory="/tmp")
+        with ThreadingHTTPServer(("127.0.0.1", port), h) as srv:
+            print("serving http://127.0.0.1:%d/muse-stats.html" % port)
+            srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
